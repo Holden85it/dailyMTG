@@ -88,6 +88,16 @@ def calculate_pnl(history, current_value):
     else:
         return "Loss: {}".format(int(round(difference,0)))
 
+def calculate_weekly_pnl(history, current_value):
+        # Filter the history list to include only those dictionaries with dates from the past week
+        one_week_ago = today - datetime.timedelta(weeks=1)
+        filtered_history = [entry for entry in history if entry["Date"] == one_week_ago.strftime("%d-%b-%Y")]
+
+        # Calculate the weekly PnL using the filtered history list and the current value
+        weekly_pnl = calculate_pnl(filtered_history, current_value)
+        return f"Weekly PnL: {weekly_pnl}"
+
+
 def append_to_csv(filename, data, new_data):
     with open(filename, "a") as file:
         fieldnames = data[0].keys()
@@ -102,12 +112,19 @@ filename = os.path.join(cwd, "portfolioHistory.csv")
 # Load the data from the CSV file
 data = load_csv(filename)
 
-# Calculate the profit and loss
-pnl = calculate_pnl(data, current_value)
-print(pnl)
-
 # Get the current date and format it using the same format as the dates in the CSV file
 current_date = datetime.datetime.now().strftime("%d-%b-%Y")
+
+# Calculate the profit and loss
+pnl = calculate_pnl(data, current_value)
+
+today = datetime.datetime.today()
+day_of_week = today.weekday()
+
+if day_of_week == 4:
+    week_pnl = calculate_weekly_pnl(data, current_value)
+    pnl += "\n" + week_pnl
+print(pnl)
 
 # Append the current value to the CSV file
 new_data = {"Date": current_date, "Value": int(round(current_value,0))}
