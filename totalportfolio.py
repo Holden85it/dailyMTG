@@ -97,6 +97,15 @@ def calculate_weekly_pnl(history, current_value):
         weekly_pnl = calculate_pnl(filtered_history, current_value)
         return f"Weekly PnL: {weekly_pnl}"
 
+def calculate_monthly_pnl(history, current_value):
+        # Filter the history list to include only those dictionaries with dates from the past week
+        one_month_ago = today.replace(day=1, hour=0, minute=0, second=0, microsecond=0) + datetime.timedelta(days=-1)
+        filtered_history = [entry for entry in history if entry["Date"] == one_month_ago.strftime("%d-%b-%Y")]
+
+        # Calculate the weekly PnL using the filtered history list and the current value
+        month_pnl = calculate_pnl(filtered_history, current_value)
+        return f"Monthly PnL: {month_pnl}"
+
 
 def append_to_csv(filename, data, new_data):
     with open(filename, "a") as file:
@@ -125,6 +134,16 @@ if day_of_week == 4:
     week_pnl = calculate_weekly_pnl(data, current_value)
     pnl += "\n" + week_pnl
 print(pnl)
+
+next_month = today.month + 1 if today.month < 12 else 1
+next_year = today.year + 1 if next_month == 1 else today.year
+last_day_current_month = today.replace(year = next_year, month=next_month, day=1, hour=0, minute=0, second=0, microsecond=0) + datetime.timedelta(days=-1)
+
+if today.date() == last_day_current_month.date():
+    monthly_pnl = calculate_monthly_pnl(data, current_value)
+    pnl += "\n" + monthly_pnl
+print(pnl)
+
 
 # Append the current value to the CSV file
 new_data = {"Date": current_date, "Value": int(round(current_value,0))}
