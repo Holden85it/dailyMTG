@@ -68,7 +68,8 @@ def send_quiz():
 
     rates = {}
     for card in quiz_cards:
-        match = lands_df[lands_df["name"].str.strip() == card]
+        cardFirstName = card.split(" //", 1)[0]
+        match = lands_df[lands_df["name"].str.strip() == cardFirstName]
         rates[card] = float(match["avg_pick"].values[0]) if not match.empty else 0.0
 
     ranked_cards = sorted(quiz_cards, key=lambda c: rates[c], reverse=True)
