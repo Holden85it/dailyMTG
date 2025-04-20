@@ -19,6 +19,8 @@ import os, random, subprocess, requests, pandas as pd, datetime as dt
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
+CARD_NUMBER = 3
+
 EMAIL_TO   = os.getenv("EMAIL_TO",   "lcmasiero@gmail.com")
 EMAIL_FROM = os.getenv("EMAIL_FROM", "lcmasiero@gmail.com")
 USER_AGENT = "PiDraftQuiz/2.0"
@@ -64,7 +66,7 @@ def select_latest_valid_set():
 # Build and send quiz email
 def send_quiz():
     set_code, set_name, cards, lands_df = select_latest_valid_set()
-    quiz_cards = random.sample(cards, 3)
+    quiz_cards = random.sample(cards, CARD_NUMBER)
 
     rates = {}
     for card in quiz_cards:
@@ -92,7 +94,7 @@ def send_quiz():
     <h3>Ranked Answers (Best picks at the bottom)</h3>
     <table border="1" cellpadding="10">
         <tr><th>Rank</th><th>Card</th><th>Average Pick</th></tr>
-        {''.join([f'<tr><td>{5-i}</td><td>{c}</td><td>{rates[c]:.2f}</td></tr>' for i, c in enumerate(ranked_cards)])}
+        {''.join([f'<tr><td>{CARD_NUMBER-i}</td><td>{c}</td><td>{rates[c]:.2f}</td></tr>' for i, c in enumerate(ranked_cards)])}
     </table>
     </body>
     </html>
