@@ -15,52 +15,131 @@ Cron example (09:00 daily):
 0 9 * * * /usr/bin/env python3 /home/pi/daily_draft_quiz.py >> /home/pi/quiz.log 2>&1
 """
 
-import os, random, subprocess, requests, pandas as pd, datetime as dt
+import os, random, subprocess, requests, pandas as pd, datetime as dt, json
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
+
 CARD_NUMBER = 3
 
-EMAIL_TO   = os.getenv("EMAIL_TO",   "lcmasiero@gmail.com")
-EMAIL_FROM = os.getenv("EMAIL_FROM", "lcmasiero@gmail.com")
+EMAIL_TO   = os.getenv("RECIPIENT_EMAIL")
+EMAIL_FROM = os.getenv("GMAIL_SENDER_EMAIL")
 USER_AGENT = "PiDraftQuiz/2.0"
 HEADERS    = {"User-Agent": USER_AGENT, "Accept": "application/json"}
 
 TODAY       = dt.date.today().isoformat()
 SCRY_SETS   = "https://api.scryfall.com/sets"
 SCRY_CARDS  = "https://api.scryfall.com/cards/search?q=set:{code}+unique:cards"
-LANDS_STATS = "https://www.17lands.com/card_ratings/data?expansion={code}&format=PremierDraft"
+LANDS_STATS = "https://www.17lands.com/card_ratings/data?expansion={code}&format=PremierDraft&start_date=2016-01-01"
 
 MAGIC_CARD_BACK = "https://upload.wikimedia.org/wikipedia/en/a/aa/Magic_the_gathering-card_back.jpg"
 
+WEEKEND_SETS = {
+    "XLN": "Ixalan",
+    "RIX": "Rivals of Ixalan",
+    "DOM": "Dominaria",
+    "M19": "Core Set 2019",
+    "GRN": "Guilds of Ravnica",
+    "RNA": "Ravnica Allegiance",
+    "WAR": "War of the Spark",
+    "M20": "Core Set 2020",
+    "ELD": "Throne of Eldraine",
+    "THB": "Theros Beyond Death",
+    "IKO": "Ikoria: Lair of Behemoths",
+    "M21": "Core Set 2021",
+    "ZNR": "Zendikar Rising",
+    "KHM": "Kaldheim",
+    "STX": "Strixhaven: School of Mages",
+    "AFR": "Adventures in the Forgotten Realms",
+    "MID": "Innistrad: Midnight Hunt",
+    "VOW": "Innistrad: Crimson Vow",
+    "NEO": "Kamigawa: Neon Dynasty",
+    "SNC": "Streets of New Capenna",
+    "DMU": "Dominaria United",
+    "BRO": "The Brothers' War",
+    "ONE": "Phyrexia: All Will Be One",
+    "MOM": "March of the Machine",
+    "WOE": "Wilds of Eldraine"
+}
+
 # Fetch cards from Scryfall, excluding basic lands
 def fetch_cards(code):
+    code = code.lower()
+    folder = "scryfall"
+    filename = os.path.join(folder, f"{code}_cards.json")
+    
+    os.makedirs(folder, exist_ok=True)
     url = SCRY_CARDS.format(code=code)
     cards = []
-    while url:
-        r = requests.get(url, headers=HEADERS).json()
-        cards += [c["name"] for c in r.get("data", []) if 'Basic Land' not in c["type_line"]]
-        url = r.get("next_page")
-    return cards
+
+    try:
+        while url:
+            r = requests.get(url, headers=HEADERS)
+            if r.status_code != 200:
+                raise Exception(f"HTTP {r.status_code}")
+            data = r.json()
+            cards += [c["name"] for c in data.get("data", []) if 'Basic Land' not in c["type_line"]]
+            url = data.get("next_page")
+        with open(filename, "w") as f:
+            json.dump(cards, f, indent=2)
+        return cards
+    except Exception as e:
+        print(f"Error fetching cards: {e}")
+
+    # Try to load from local file if fetch failed
+    if os.path.exists(filename):
+        print(f"Loading cards from local cache: {filename}")
+        with open(filename, "r") as f:
+            return json.load(f)
+
+    print("No card data available.")
+    return []
 
 # Fetch stats from 17Lands
 def fetch_17lands(code):
-    url = LANDS_STATS.format(code=code.upper())
-    r = requests.get(url, headers=HEADERS)
-    if r.status_code != 200:
-        return None
-    return pd.read_json(r.text)
+    code = code.upper()
+    folder = "17lands"
+    filename = os.path.join(folder, f"{code}.json")
+    
+    # Ensure the folder exists
+    os.makedirs(folder, exist_ok=True)
+
+    url = LANDS_STATS.format(code=code)
+    try:
+        r = requests.get(url, headers=HEADERS)
+        if r.status_code == 200:
+            df = pd.read_json(r.text)
+            df.to_json(filename, orient='records', indent=2)
+            return df
+        else:
+            print(f"Failed to fetch from web. Status code: {r.status_code}")
+    except Exception as e:
+        print(f"Error fetching data: {e}")
+
+    # Try to load from local file if fetch failed
+    if os.path.exists(filename):
+        print(f"Loading data from local cache: {filename}")
+        return pd.read_json(filename)
+
+    print("No data available.")
+    return None
 
 # Select latest valid set
 def select_latest_valid_set():
-    sets = requests.get(SCRY_SETS, headers=HEADERS).json()["data"]
-    draftable = sorted([s for s in sets if s["set_type"] in ("core", "expansion") and s.get("released_at") <= TODAY], key=lambda s: s["released_at"], reverse=True)
-    for s in draftable:
-        code = s["code"]
-        cards = fetch_cards(code)
-        lands = fetch_17lands(code)
-        if lands is not None and not lands.empty and len(cards) >= 5:
-            return code, s["name"], cards, lands
+
+    today = dt.datetime.today().weekday()  # Monday=0, Sunday=6
+    if today >= 4:  # Friday (4), Saturday (5), Sunday (6)
+        code = random.choice(list(WEEKEND_SETS.keys()))
+        setName = WEEKEND_SETS[code]
+    else:
+        sets = requests.get(SCRY_SETS, headers=HEADERS).json()["data"]
+        draftable = sorted([s for s in sets if s["set_type"] in ("core", "expansion") and s.get("released_at") <= TODAY], key=lambda s: s["released_at"], reverse=True)
+        code = draftable[0]["code"]
+        setName = draftable[0]["name"]
+    cards = fetch_cards(code)
+    lands = fetch_17lands(code)
+    if lands is not None and not lands.empty and len(cards) >= 5:
+        return code, setName, cards, lands
     raise RuntimeError("No valid set found.")
 
 # Build and send quiz email
