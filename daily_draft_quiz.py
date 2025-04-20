@@ -19,6 +19,8 @@ import os, random, subprocess, requests, pandas as pd, datetime as dt, json
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
+from dotenv import load_dotenv
+load_dotenv()
 
 CARD_NUMBER = 3
 
@@ -109,7 +111,11 @@ def fetch_17lands(code):
         r = requests.get(url, headers=HEADERS)
         if r.status_code == 200:
             df = pd.read_json(r.text)
-            df.to_json(filename, orient='records', indent=2)
+
+    	    # Save as pretty JSON manually
+            with open(filename, 'w') as f:
+            	json.dump(json.loads(df.to_json(orient='records')), f, indent=2)
+            
             return df
         else:
             print(f"Failed to fetch from web. Status code: {r.status_code}")
