@@ -19,16 +19,18 @@ from pathlib import Path
 from typing import Dict, List
 
 import requests
+from requests.auth import HTTPBasicAuth
 import pandas as pd
 from requests.exceptions import RequestException
 
 # --------------------------------------------------------------------------- #
-# Configuration – prefer env vars over literals
+# Configuration – prefer env vars over literals
 CMC_API_KEY = "738beaa5-ec04-4767-8a84-5509e5afb6da"
 CMC_ENDPOINT = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest"
 
+# Use Basic Auth instead of custom header to avoid client-specific header issues
 PUSHBULLET_KEY = "o.52oPsw0YJky0iG8Xwksnk7VR32SDx1yy"
-PUSH_ENDPOINT = "https://api.pushbullet.com/v2/pushes"  # keep configurable if needed
+PUSH_ENDPOINT = "https://api.pushbullet.com/v2/pushes"
 
 CURRENCIES = [
     "BTC", "ETH", "ADA", "DOGE", "ATOM", "DOT",
@@ -43,12 +45,17 @@ HISTORY_CSV = DATA_DIR / "portfolioHistory.csv"
 
 # --------------------------------------------------------------------------- #
 def send_push(title: str, body: str) -> None:
-    """Send a note to Pushbullet; raise on failure."""
+    """Send a note to Pushbullet via HTTP Basic Auth; raise on failure."""
     payload = {"type": "note", "title": title, "body": body}
-    headers = {"Access-Token": PUSHBULLET_KEY, "Content-Type": "application/json"}
-    resp = requests.post(PUSH_ENDPOINT, json=payload, headers=headers, timeout=10)
+    # Use Basic Auth: token as username, empty password
+    resp = requests.post(
+        PUSH_ENDPOINT,
+        auth=HTTPBasicAuth(PUSHBULLET_KEY, ""),
+        json=payload,
+        timeout=10
+    )
     if resp.status_code != 200:
-        raise RuntimeError(f"Pushbullet error: {resp.status_code} – {resp.text[:100]}")
+        raise RuntimeError(f"Pushbullet error: {resp.status_code} – {resp.text[:100]}")
 
 # --------------------------------------------------------------------------- #
 def fetch_prices() -> pd.DataFrame:
@@ -163,7 +170,6 @@ def main() -> int:
     try:
         send_push("DailyPnL", body_msg)
     except RuntimeError as e:
-        # Push failed – nothing more we can do; return error
         print(e, file=sys.stderr)
         return 400
 
@@ -171,7 +177,6 @@ def main() -> int:
     try:
         append_history(HISTORY_CSV, current_val)
     except OSError as e:
-        # Can't write history, but the main job succeeded
         print(f"Warning: could not write history – {e}", file=sys.stderr)
 
     return 0
