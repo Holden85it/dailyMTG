@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Daily MTG Draft P1P1 Quiz — Enhanced HTML Version
+Daily MTG Quiz — Mystery Pair Edition
 
-• Automatically selects the latest draftable set with 17Lands data.
-• Picks 5 random non-basic land cards for a quiz.
-• Sends a multipart email (plain text + HTML) showing cards, a buffer image, and reveals ranked answers at the end.
+• Picks one random draftable set (any era) and two random cards from it.
+• You guess which set the cards are from, and which of the two is the
+  stronger limited pick.
+• Ratings: 17Lands avg_pick for modern (Arena-era) sets, Forge's .rnk
+  draft rankings for everything older (format #Rank|Name|Rarity|Set,
+  rank 1 = best card in the set — the same data Forge's draft AI uses).
 
 Dependencies:
 sudo apt install python3-pip msmtp
@@ -15,180 +18,302 @@ Cron example (09:00 daily):
 0 9 * * * /usr/bin/env python3 /home/pi/daily_draft_quiz.py >> /home/pi/quiz.log 2>&1
 """
 
-import os, random, subprocess, requests, pandas as pd, datetime as dt, json
+import os, random, requests, io, pandas as pd, datetime as dt, json
+from urllib.parse import quote
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+import smtplib
+import ssl
 
 from dotenv import load_dotenv
 load_dotenv()
 
-CARD_NUMBER = 3
-
 EMAIL_TO   = os.getenv("RECIPIENT_EMAIL")
 EMAIL_FROM = os.getenv("GMAIL_SENDER_EMAIL")
-USER_AGENT = "PiDraftQuiz/2.0"
+USER_AGENT = "PiDraftQuiz/3.0"
 HEADERS    = {"User-Agent": USER_AGENT, "Accept": "application/json"}
 
 TODAY       = dt.date.today().isoformat()
 SCRY_SETS   = "https://api.scryfall.com/sets"
-SCRY_CARDS  = "https://api.scryfall.com/cards/search?q=set:{code}+unique:cards"
+SCRY_NAMED  = "https://api.scryfall.com/cards/named?fuzzy={name}&set={code}"
 LANDS_STATS = "https://www.17lands.com/card_ratings/data?expansion={code}&format=PremierDraft&start_date=2016-01-01"
+FORGE_RNK   = "https://raw.githubusercontent.com/Card-Forge/forge/master/forge-gui/res/draft/rankings/{code}.rnk"
+
+# 17Lands only has data for Arena-era sets; XLN (2017-09) is the oldest.
+LANDS_CUTOFF = "2017-09-01"
+
+# Minimum rank distance between the two cards, as a fraction of the set
+# size, so the "which is stronger" answer isn't a coin flip.
+MIN_RANK_GAP = 0.10
+
+MAX_SET_TRIES  = 10   # sets to try before giving up
+MAX_CARD_TRIES = 12   # card draws per set before moving to the next set
 
 MAGIC_CARD_BACK = "https://upload.wikimedia.org/wikipedia/en/a/aa/Magic_the_gathering-card_back.jpg"
 
-WEEKEND_SETS = {
-    "XLN": "Ixalan",
-    "RIX": "Rivals of Ixalan",
-    "DOM": "Dominaria",
-    "M19": "Core Set 2019",
-    "GRN": "Guilds of Ravnica",
-    "RNA": "Ravnica Allegiance",
-    "WAR": "War of the Spark",
-    "M20": "Core Set 2020",
-    "ELD": "Throne of Eldraine",
-    "THB": "Theros Beyond Death",
-    "IKO": "Ikoria: Lair of Behemoths",
-    "M21": "Core Set 2021",
-    "ZNR": "Zendikar Rising",
-    "KHM": "Kaldheim",
-    "STX": "Strixhaven: School of Mages",
-    "AFR": "Adventures in the Forgotten Realms",
-    "MID": "Innistrad: Midnight Hunt",
-    "VOW": "Innistrad: Crimson Vow",
-    "NEO": "Kamigawa: Neon Dynasty",
-    "SNC": "Streets of New Capenna",
-    "DMU": "Dominaria United",
-    "BRO": "The Brothers' War",
-    "ONE": "Phyrexia: All Will Be One",
-    "MOM": "March of the Machine",
-    "WOE": "Wilds of Eldraine"
-}
+BASIC_LANDS = {"Plains", "Island", "Swamp", "Mountain", "Forest", "Wastes"}
 
-# Fetch cards from Scryfall, excluding basic lands
-def fetch_cards(code):
-    code = code.lower()
-    folder = "scryfall"
-    filename = os.path.join(folder, f"{code}_cards.json")
-    
-    os.makedirs(folder, exist_ok=True)
-    url = SCRY_CARDS.format(code=code)
-    cards = []
+# Scryfall set code -> Forge .rnk filename, where they disagree
+# ("con" is a reserved filename on Windows, hence Forge's "cfx").
+FORGE_CODE_ALIASES = {"con": "cfx", "nem": "nms"}
 
-    try:
-        while url:
-            r = requests.get(url, headers=HEADERS)
-            if r.status_code != 200:
-                raise Exception(f"HTTP {r.status_code}")
-            data = r.json()
-            cards += [c["name"] for c in data.get("data", []) if 'Basic Land' not in c["type_line"]]
-            url = data.get("next_page")
-        with open(filename, "w") as f:
-            json.dump(cards, f, indent=2)
-        return cards
-    except Exception as e:
-        print(f"Error fetching cards: {e}")
 
-    # Try to load from local file if fetch failed
-    if os.path.exists(filename):
-        print(f"Loading cards from local cache: {filename}")
-        with open(filename, "r") as f:
-            return json.load(f)
+# ---------------------------------------------------------------- ratings
 
-    print("No card data available.")
-    return []
-
-# Fetch stats from 17Lands
 def fetch_17lands(code):
+    """Return [(name, rank, total)] from 17Lands avg_pick, or None."""
     code = code.upper()
     folder = "17lands"
     filename = os.path.join(folder, f"{code}.json")
-    
-    # Ensure the folder exists
     os.makedirs(folder, exist_ok=True)
 
-    url = LANDS_STATS.format(code=code)
+    df = None
     try:
-        r = requests.get(url, headers=HEADERS)
+        r = requests.get(LANDS_STATS.format(code=code), headers=HEADERS, timeout=30)
         if r.status_code == 200:
-            df = pd.read_json(r.text)
-
-    	    # Save as pretty JSON manually
-            with open(filename, 'w') as f:
-            	json.dump(json.loads(df.to_json(orient='records')), f, indent=2)
-            
-            return df
+            df = pd.read_json(io.StringIO(r.text))
+            if not df.empty:
+                with open(filename, 'w') as f:
+                    json.dump(json.loads(df.to_json(orient='records')), f, indent=2)
         else:
-            print(f"Failed to fetch from web. Status code: {r.status_code}")
+            print(f"17Lands {code}: HTTP {r.status_code}")
     except Exception as e:
-        print(f"Error fetching data: {e}")
+        print(f"17Lands {code}: {e}")
 
-    # Try to load from local file if fetch failed
-    if os.path.exists(filename):
-        print(f"Loading data from local cache: {filename}")
-        return pd.read_json(filename)
+    if (df is None or df.empty) and os.path.exists(filename):
+        print(f"17Lands {code}: using local cache")
+        try:
+            df = pd.read_json(filename)
+        except Exception as e:
+            print(f"17Lands {code}: bad cache file: {e}")
+            return None
 
-    print("No data available.")
-    return None
+    if df is None or df.empty or "name" not in df.columns or "avg_pick" not in df.columns:
+        return None
 
-# Select latest valid set
-def select_latest_valid_set():
+    df = df[~df["name"].isin(BASIC_LANDS)].dropna(subset=["avg_pick"])
+    df = df.sort_values("avg_pick")  # lower avg_pick = picked earlier = better
+    total = len(df)
+    if total < 5:
+        print(f"17Lands {code}: only {total} rated cards, skipping")
+        return None
+    return [(str(name), i + 1, total) for i, name in enumerate(df["name"])]
 
-    today = dt.datetime.today().weekday()  # Monday=0, Sunday=6
-    if today >= 4:  # Friday (4), Saturday (5), Sunday (6)
-        code = random.choice(list(WEEKEND_SETS.keys()))
-        setName = WEEKEND_SETS[code]
-    else:
-        sets = requests.get(SCRY_SETS, headers=HEADERS).json()["data"]
-        draftable = sorted([s for s in sets if s["set_type"] in ("core", "expansion") and s.get("released_at") <= TODAY], key=lambda s: s["released_at"], reverse=True)
-        code = draftable[0]["code"]
-        setName = draftable[0]["name"]
-    cards = fetch_cards(code)
-    lands = fetch_17lands(code)
-    if lands is not None and not lands.empty and len(cards) >= 5:
-        return code, setName, cards, lands
-    raise RuntimeError("No valid set found.")
 
-# Build and send quiz email
+def fetch_forge(code):
+    """Return [(name, rank, total)] from Forge's .rnk file, or None."""
+    code = FORGE_CODE_ALIASES.get(code.lower(), code.lower())
+    folder = "forge"
+    filename = os.path.join(folder, f"{code}.rnk")
+    os.makedirs(folder, exist_ok=True)
+
+    text = None
+    try:
+        r = requests.get(FORGE_RNK.format(code=code), headers={"User-Agent": USER_AGENT}, timeout=30)
+        if r.status_code == 200:
+            text = r.text
+            with open(filename, "w") as f:
+                f.write(text)
+        elif r.status_code != 404:
+            print(f"Forge {code}: HTTP {r.status_code}")
+    except Exception as e:
+        print(f"Forge {code}: {e}")
+
+    if text is None and os.path.exists(filename):
+        print(f"Forge {code}: using local cache")
+        with open(filename) as f:
+            text = f.read()
+
+    if text is None:
+        return None
+
+    # Format: #Rank|Name|Rarity|Set  (rank 1 = best card in the set)
+    entries = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("#"):
+            continue
+        parts = line[1:].split("|")
+        if len(parts) < 4:
+            continue
+        try:
+            entries.append((parts[1].strip(), int(parts[0].strip())))
+        except ValueError:
+            continue
+    if len(entries) < 5:
+        print(f"Forge {code}: only {len(entries)} rated cards, skipping")
+        return None
+    total = max(rank for _, rank in entries)
+    return [(name, rank, total) for name, rank in entries]
+
+
+def get_ratings(set_info):
+    """Pick the rating source for a set: 17Lands for modern, Forge otherwise."""
+    if set_info["released_at"] >= LANDS_CUTOFF:
+        ratings = fetch_17lands(set_info["code"])
+        if ratings:
+            return ratings, "17Lands"
+    ratings = fetch_forge(set_info["code"])
+    if ratings:
+        return ratings, "Forge"
+    print(f"No limited ratings for {set_info['code'].upper()} ({set_info['name']})")
+    return None, None
+
+
+# ---------------------------------------------------------------- cards
+
+def resolve_card(name, set_code):
+    """Look the card up on Scryfall (fuzzy: tolerates Forge's stripped accents
+    and split-card names). Returns (canonical_name, image_url) or None."""
+    url = SCRY_NAMED.format(name=quote(name), code=set_code.lower())
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=30)
+        if r.status_code != 200:
+            print(f"Scryfall: no match for '{name}' in {set_code}: HTTP {r.status_code}")
+            return None
+        card = r.json()
+    except Exception as e:
+        print(f"Scryfall: error resolving '{name}' in {set_code}: {e}")
+        return None
+
+    image = card.get("image_uris", {}).get("normal")
+    if not image and card.get("card_faces"):
+        image = card["card_faces"][0].get("image_uris", {}).get("normal")
+    if not image:
+        print(f"Scryfall: no image for '{name}' in {set_code}")
+        return None
+    return card["name"], image
+
+
+def get_draftable_sets():
+    try:
+        r = requests.get(SCRY_SETS, headers=HEADERS, timeout=30)
+        r.raise_for_status()
+        sets = r.json()["data"]
+    except Exception as e:
+        raise RuntimeError(f"Could not fetch set list from Scryfall: {e}")
+    pool = [s for s in sets
+            if s["set_type"] in ("core", "expansion")
+            and s.get("released_at", "9999") <= TODAY
+            and not s.get("digital", False)]
+    if not pool:
+        raise RuntimeError("Scryfall returned no draftable sets.")
+    return pool
+
+
+def pick_quiz_pair():
+    """Pick a random rated set and two cards from it (with a rank gap)."""
+    pool = get_draftable_sets()
+    random.shuffle(pool)
+
+    for s in pool[:MAX_SET_TRIES]:
+        ratings, source = get_ratings(s)
+        if not ratings:
+            continue
+
+        total = ratings[0][2]
+        min_gap = max(1, int(total * MIN_RANK_GAP))
+        picks = []
+        for _ in range(MAX_CARD_TRIES):
+            name, rank, _ = random.choice(ratings)
+            if any(p["rank"] == rank or p["raw_name"] == name for p in picks):
+                continue
+            if picks and abs(picks[0]["rank"] - rank) < min_gap:
+                continue
+            resolved = resolve_card(name, s["code"])
+            if not resolved:
+                continue
+            canonical, image = resolved
+            picks.append({
+                "raw_name": name,
+                "name": canonical,
+                "image": image,
+                "rank": rank,
+                "total": total,
+            })
+            if len(picks) == 2:
+                return {
+                    "set_code": s["code"].upper(),
+                    "set_name": s["name"],
+                    "source": source,
+                    "cards": picks,
+                }
+        print(f"Could not assemble a pair from {s['code'].upper()}, trying next set")
+
+    raise RuntimeError(f"No usable set found after {MAX_SET_TRIES} attempts.")
+
+
+# ---------------------------------------------------------------- email
+
 def send_quiz():
-    set_code, set_name, cards, lands_df = select_latest_valid_set()
-    quiz_cards = random.sample(cards, CARD_NUMBER)
+    quiz = pick_quiz_pair()
+    cards = quiz["cards"]
+    winner = min(cards, key=lambda c: c["rank"])
 
-    rates = {}
-    for card in quiz_cards:
-        cardFirstName = card.split(" //", 1)[0]
-        match = lands_df[lands_df["name"].str.strip() == cardFirstName]
-        rates[card] = float(match["avg_pick"].values[0]) if not match.empty else 0.0
+    msg            = MIMEMultipart("alternative")
+    msg["Subject"] = f"MTG Daily Quiz — Mystery Pair ({TODAY})"
+    msg["From"]    = EMAIL_FROM
+    msg["To"]      = EMAIL_TO
 
-    ranked_cards = sorted(quiz_cards, key=lambda c: rates[c], reverse=True)
+    labels = ["A", "B"]
+    winner_label = labels[cards.index(winner)]
 
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = f"MTG Daily Quiz — {set_name} ({set_code.upper()})"
-    msg["From"] = EMAIL_FROM
-    msg["To"] = EMAIL_TO
+    plain_text = "Guess which set these cards are from, and which is the stronger limited pick:\n"
+    plain_text += "\n".join(f"- Card {l}: {c['name']}" for l, c in zip(labels, cards))
+    plain_text += (
+        f"\n\nAnswers:\nSet: {quiz['set_name']} ({quiz['set_code']})\n"
+        + "\n".join(f"Card {l}: #{c['rank']} of {c['total']}" for l, c in zip(labels, cards))
+        + f"\nStronger pick: Card {winner_label} — {winner['name']}"
+    )
 
-    plain_text = "\n".join([f"- {c}" for c in quiz_cards])
+    html_cards = "".join(
+        f'<div><h3>Card {l}</h3><img src="{c["image"]}" height="350"></div><br>'
+        for l, c in zip(labels, cards)
+    )
+
+    html_answers = "".join(
+        f"<tr><td>Card {l}</td><td>{c['name']}</td>"
+        f"<td>#{c['rank']} of {c['total']} (top {100 * c['rank'] / c['total']:.0f}%)</td></tr>"
+        for l, c in zip(labels, cards)
+    )
 
     html_content = f"""
     <html>
-    <body>
-    <h2>Today's Draft Quiz: {set_name}</h2>
-    {''.join([f'<div><img src="https://api.scryfall.com/cards/named?exact={c}&format=image" height="350"></div><br>' for c in quiz_cards])}
-
-    <div style="margin:30px 0;"><img src="{MAGIC_CARD_BACK}" height="350"></div>
-
-    <h3>Ranked Answers (Best picks at the bottom)</h3>
-    <table border="1" cellpadding="10">
-        <tr><th>Rank</th><th>Card</th><th>Average Pick</th></tr>
-        {''.join([f'<tr><td>{CARD_NUMBER-i}</td><td>{c}</td><td>{rates[c]:.2f}</td></tr>' for i, c in enumerate(ranked_cards)])}
-    </table>
-    </body>
+      <body>
+        <h2>Today's Quiz: which set — and which is the stronger limited pick?</h2>
+        {html_cards}
+        <div style="margin:30px 0;"><img src="{MAGIC_CARD_BACK}" height="350"></div>
+        <h3>Answers</h3>
+        <p>Set: <b>{quiz['set_name']} ({quiz['set_code']})</b> — ratings from {quiz['source']}</p>
+        <table border="1" cellpadding="10">
+          <tr><th></th><th>Card</th><th>Limited rating</th></tr>
+          {html_answers}
+        </table>
+        <p><b>Stronger limited pick: Card {winner_label} — {winner['name']}</b></p>
+      </body>
     </html>
     """
 
     msg.attach(MIMEText(plain_text, "plain"))
     msg.attach(MIMEText(html_content, "html"))
 
-    subprocess.run(["msmtp", "-t"], input=msg.as_bytes(), check=True)
+    # -------------------- send via SMTP --------------------
+    smtp_host = os.getenv("SMTP_HOST", "smtp.gmail.com")
+    smtp_port = int(os.getenv("SMTP_PORT", "465"))         # 465 = SSL; use 587 for STARTTLS
+    smtp_user = os.getenv("SMTP_USER", EMAIL_FROM)
+    smtp_pass = os.getenv("SMTP_PASS")
+
+    if not smtp_pass:
+        raise RuntimeError("SMTP_PASS environment variable not set.")
+
+    context = ssl.create_default_context()
+
+    with smtplib.SMTP_SSL(host=smtp_host, port=smtp_port, context=context) as server:
+        server.login(smtp_user, smtp_pass)
+        server.sendmail(EMAIL_FROM, [EMAIL_TO], msg.as_string())
+
+    print(f"{TODAY}: sent quiz for {quiz['set_name']} ({quiz['set_code']}), "
+          f"cards: {', '.join(c['name'] for c in cards)}")
 
 if __name__ == '__main__':
     send_quiz()

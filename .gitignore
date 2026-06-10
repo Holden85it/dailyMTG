@@ -1,5 +1,6 @@
 17lands/
 scryfall/
+forge/
 *.json
 *.csv
 .env
