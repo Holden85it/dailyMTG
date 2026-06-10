@@ -4,3 +4,4 @@ forge/
 *.json
 *.csv
 .env
+quiz.log
